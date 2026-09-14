@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew Claude Code Remote TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/var/lib/acme.sh/acme.sh --cron --home /var/lib/acme.sh --config-home /var/lib/acme.sh/config --cert-home /var/lib/acme.sh/certs --treat-skip-as-success
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/acme.sh /etc/nginx/ssl/claude.zlink.my.id

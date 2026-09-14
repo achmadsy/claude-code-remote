@@ -18,11 +18,19 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import uvicorn
 
-TMUX = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-TAILSCALE = shutil.which("tailscale") or "/usr/local/bin/tailscale"
-TTYD_PORT = 7681
-WRAPPER_PORT = 8080
+TMUX = shutil.which("tmux") or "/usr/bin/tmux"
+TAILSCALE = shutil.which("tailscale") or "/usr/bin/tailscale"
+BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
+TTYD_PORT = int(os.environ.get("TTYD_PORT", "7681"))
+WRAPPER_PORT = int(os.environ.get("WRAPPER_PORT", "7682"))
 TMUX_SESSION = "claude"
+UPLOAD_DIR = Path(
+    os.environ.get(
+        "UPLOAD_DIR",
+        "/home/ubuntu/claude-code-remote/uploads",
+    )
+)
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MiB
 
 
 app = FastAPI()
@@ -30,9 +38,16 @@ app = FastAPI()
 
 def get_tailscale_ip():
     result = subprocess.run(
-        [TAILSCALE, "ip", "-4"], capture_output=True, text=True
+        [TAILSCALE, "ip", "-4"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
     )
-    return result.stdout.strip()
+    ip = result.stdout.strip()
+    if not ip:
+        raise RuntimeError("Tailscale has no IPv4 address")
+    return ip
 
 
 class TextInput(BaseModel):
@@ -60,17 +75,23 @@ async def index():
             overflow: hidden;
             font-family: -apple-system, system-ui, sans-serif;
             touch-action: manipulation;
+            overscroll-behavior: none;
+            -webkit-text-size-adjust: 100%;
         }}
         .container {{
             display: flex;
             flex-direction: column;
             height: 100vh;
             height: 100dvh;
+            overflow: hidden;
         }}
         .terminal-frame {{
             flex: 1;
             border: none;
             width: 100%;
+            touch-action: none;
+            overscroll-behavior: none;
+            background: #1e1e1e;
         }}
         .quick-keys {{
             display: flex;
@@ -161,6 +182,8 @@ async def index():
             -webkit-user-select: text;
             user-select: text;
             -webkit-overflow-scrolling: touch;
+            touch-action: pan-y;
+            overscroll-behavior: contain;
         }}
         .copy-hint {{
             color: #888;
@@ -183,15 +206,21 @@ async def index():
 </head>
 <body>
     <div class="container">
-        <iframe class="terminal-frame" src="http://{ip}:{TTYD_PORT}"></iframe>
+        <iframe class="terminal-frame" src="/terminal/"></iframe>
         <div class="quick-keys">
             <button onclick="sendKey('Up')">&#9650;</button>
             <button onclick="sendKey('Down')">&#9660;</button>
+            <button onclick="sendKey('Left')">&#9664;</button>
+            <button onclick="sendKey('Right')">&#9654;</button>
             <button onclick="sendKey('Tab')">Tab</button>
+            <button onclick="sendKey('S-Tab')">⇧Tab</button>
             <button onclick="sendKey('Escape')">Esc</button>
             <button onclick="sendKey('C-c')">Ctrl+C</button>
+            <button onclick="sendKey('C-b')">Ctrl+B</button>
             <button onclick="sendKey('Enter')">Enter</button>
             <button onclick="sendKey('C-l')">Clear</button>
+            <button onclick="sendKey('PPage')">PgUp</button>
+            <button onclick="sendKey('NPage')">PgDn</button>
             <button onclick="newSession()">New</button>
             <button onclick="resumeSession()">Resume</button>
             <button onclick="copyPane()">Copy</button>
@@ -215,7 +244,7 @@ async def index():
     </div>
     <script>
         const input = document.getElementById('cmd');
-        const UPLOAD_DIR = '/tmp/claude-uploads/';
+        const UPLOAD_DIR = '{UPLOAD_DIR}/';
 
         // Auto-resize textarea as content grows
         input.addEventListener('input', () => {{
@@ -385,14 +414,158 @@ async def index():
             }}
         }}
 
-        // Auto-reconnect: reload iframe when tab becomes visible again
+        // iOS/touch: map vertical swipes inside the ttyd iframe to scrollback.
+        // The iframe is same-origin, so we can attach listeners to its document.
         const terminal = document.querySelector('.terminal-frame');
+        let touchState = null;
+        let touchHandlersAttached = false;
+
+        function terminalDoc() {{
+            try {{
+                return terminal.contentDocument;
+            }} catch (err) {{
+                return null;
+            }}
+        }}
+
+        function scrollTargets() {{
+            const doc = terminalDoc();
+            if (!doc) return null;
+            const viewport =
+                doc.querySelector('.xterm-viewport') ||
+                doc.querySelector('.xterm-screen') ||
+                doc.querySelector('.xterm') ||
+                doc.body;
+            if (!viewport) return null;
+            const wheelTarget =
+                doc.querySelector('.xterm') ||
+                doc.querySelector('.xterm-viewport') ||
+                viewport;
+            return {{ viewport, wheelTarget }};
+        }}
+
+        function scrollTerminalBy(deltaY) {{
+            if (!deltaY) return;
+            const targets = scrollTargets();
+            if (!targets) return;
+            const {{ viewport, wheelTarget }} = targets;
+
+            // Real scrollable viewport: adjust scrollTop directly (no wheel, avoids 2x).
+            if (typeof viewport.scrollTop === 'number') {{
+                const before = viewport.scrollTop;
+                viewport.scrollTop = before + deltaY;
+                if (viewport.scrollTop !== before) return;
+            }}
+
+            // Virtual/transformed viewport: ask xterm via wheel.
+            try {{
+                wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
+                    deltaX: 0,
+                    deltaY: deltaY,
+                    deltaMode: 0,
+                    bubbles: true,
+                    cancelable: true,
+                    view: terminal.contentWindow,
+                }}));
+            }} catch (err) {{
+                // ignore
+            }}
+        }}
+
+        function onTermTouchStart(e) {{
+            if (e.touches.length !== 1) {{
+                touchState = null;
+                return;
+            }}
+            touchState = {{
+                lastX: e.touches[0].clientX,
+                lastY: e.touches[0].clientY,
+                axis: null,
+            }};
+        }}
+
+        function onTermTouchMove(e) {{
+            if (!touchState || e.touches.length !== 1) return;
+            const x = e.touches[0].clientX;
+            const y = e.touches[0].clientY;
+            const dx = x - touchState.lastX;
+            const dy = y - touchState.lastY;
+            touchState.lastX = x;
+            touchState.lastY = y;
+
+            if (!touchState.axis) {{
+                if (Math.abs(dy) > 8 && Math.abs(dy) > Math.abs(dx)) {{
+                    touchState.axis = 'y';
+                }} else if (Math.abs(dx) > 8) {{
+                    touchState.axis = 'x';
+                }} else {{
+                    return;
+                }}
+            }}
+
+            if (touchState.axis !== 'y') return;
+
+            // Finger up (dy < 0) → view further down (positive scroll).
+            e.preventDefault();
+            scrollTerminalBy(-dy * 1.15);
+        }}
+
+        function onTermTouchEnd(e) {{
+            touchState = null;
+        }}
+
+        function attachTerminalTouchScroll() {{
+            const doc = terminalDoc();
+            if (!doc || !doc.documentElement) return;
+            if (touchHandlersAttached && doc === attachTerminalTouchScroll._doc) return;
+
+            const root = doc.documentElement;
+            root.addEventListener('touchstart', onTermTouchStart, {{ passive: true }});
+            root.addEventListener('touchmove', onTermTouchMove, {{ passive: false }});
+            root.addEventListener('touchend', onTermTouchEnd, {{ passive: true }});
+            root.addEventListener('touchcancel', onTermTouchEnd, {{ passive: true }});
+
+            // Also cover the xterm node if it appears after first paint.
+            const style = doc.createElement('style');
+            style.textContent = `
+                html, body, .xterm, .xterm-viewport, .xterm-screen {{
+                    touch-action: none !important;
+                    overscroll-behavior: none !important;
+                    -webkit-overflow-scrolling: touch !important;
+                }}
+            `;
+            doc.documentElement.appendChild(style);
+
+            touchHandlersAttached = true;
+            attachTerminalTouchScroll._doc = doc;
+        }}
+
+        function armTerminalTouchScroll() {{
+            attachTerminalTouchScroll();
+            // iframe may not be ready on first paint
+            let tries = 0;
+            const timer = setInterval(() => {{
+                attachTerminalTouchScroll();
+                tries += 1;
+                if (touchHandlersAttached || tries > 40) clearInterval(timer);
+            }}, 250);
+        }}
+
+        terminal.addEventListener('load', () => {{
+            touchHandlersAttached = false;
+            touchState = null;
+            attachTerminalTouchScroll();
+        }});
+
+        // Auto-reconnect: reload iframe when tab becomes visible again
         document.addEventListener('visibilitychange', () => {{
             if (document.visibilityState === 'visible') {{
                 terminal.src = terminal.src;
+                armTerminalTouchScroll();
             }}
         }});
 
+        armTerminalTouchScroll();
         input.focus();
     </script>
 </body>
@@ -414,8 +587,8 @@ async def send_text(payload: TextInput):
 
 
 ALLOWED_KEYS = {
-    "Up", "Down", "Left", "Right", "Tab", "Escape", "Enter",
-    "C-c", "C-l", "C-d", "C-z", "C-a", "C-e", "C-k", "C-u",
+    "Up", "Down", "Left", "Right", "Tab", "S-Tab", "Escape", "Enter",
+    "C-c", "C-b", "C-l", "C-d", "C-z", "C-a", "C-e", "C-k", "C-u",
     "BSpace", "DC", "Home", "End", "PPage", "NPage",
 }
 
@@ -442,10 +615,6 @@ async def copy_pane():
     return {"text": result.stdout}
 
 
-UPLOAD_DIR = Path("/tmp/claude-uploads")
-MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
-
-
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """Save an uploaded file using its original name and return the path."""
@@ -464,20 +633,22 @@ async def upload_file(file: UploadFile = File(...)):
         ext = Path(name).suffix
         dest = UPLOAD_DIR / f"{stem}-{counter}{ext}"
         counter += 1
-    # Stream-read with size limit to avoid memory exhaustion
-    chunks = []
+    # Stream to disk and remove partial files when limit is exceeded.
     total = 0
-    while chunk := await file.read(1024 * 1024):
-        total += len(chunk)
-        if total > MAX_UPLOAD_SIZE:
-            return {"error": "File too large (max 20MB)"}
-        chunks.append(chunk)
-    dest.write_bytes(b"".join(chunks))
+    try:
+        with dest.open("xb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_UPLOAD_SIZE:
+                    raise ValueError("File too large (max 20MB)")
+                output.write(chunk)
+    except ValueError as exc:
+        dest.unlink(missing_ok=True)
+        return {"error": str(exc)}
     return {"name": dest.name, "path": str(dest)}
 
 
 if __name__ == "__main__":
-    ip = get_tailscale_ip()
-    print(f"Voice wrapper: http://{ip}:{WRAPPER_PORT}")
-    print(f"Terminal (ttyd): http://{ip}:{TTYD_PORT}")
-    uvicorn.run(app, host=ip, port=WRAPPER_PORT)
+    print(f"Voice wrapper backend: http://{BIND_HOST}:{WRAPPER_PORT}")
+    print(f"Terminal backend: http://{BIND_HOST}:{TTYD_PORT}/terminal/")
+    uvicorn.run(app, host=BIND_HOST, port=WRAPPER_PORT)

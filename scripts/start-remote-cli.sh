@@ -3,34 +3,59 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="$PROJECT_DIR/logs"
+PYTHON_BIN="${PYTHON_BIN:-$PROJECT_DIR/.venv/bin/python}"
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
+TTYD_PORT="${TTYD_PORT:-7681}"
+WRAPPER_PORT="${WRAPPER_PORT:-7682}"
+PUBLIC_URL="${PUBLIC_URL:-https://claude.zlink.my.id}"
 
-mkdir -p "$LOG_DIR"
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: required command not found: $1" >&2
+        exit 1
+    fi
+}
 
-# Get Tailscale IP
-TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
+require_command tailscale
+require_command ttyd
+require_command tmux
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "ERROR: Python environment not found: $PYTHON_BIN" >&2
+    exit 1
+fi
+
+TAILSCALE_IP="$(tailscale ip -4 2>/dev/null || true)"
 if [ -z "$TAILSCALE_IP" ]; then
     echo "ERROR: Tailscale not running or no IPv4 address" >&2
     exit 1
 fi
 
+for port in "$TTYD_PORT" "$WRAPPER_PORT"; do
+    if ss -H -ltn "sport = :$port" | grep -q .; then
+        echo "ERROR: port $port is already in use" >&2
+        exit 1
+    fi
+done
+
+TTYD_PID=""
+WRAPPER_PID=""
+
+cleanup() {
+    trap - EXIT TERM INT
+    [ -z "$WRAPPER_PID" ] || kill "$WRAPPER_PID" 2>/dev/null || true
+    [ -z "$TTYD_PID" ] || kill "$TTYD_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT
+
 echo "Tailscale IP: $TAILSCALE_IP"
 
-# Kill any existing ttyd processes
-pkill -f "ttyd" 2>/dev/null || true
-sleep 1
-
-# Keep Mac awake (kill any existing caffeinate first)
-pkill -f "caffeinate" 2>/dev/null || true
-caffeinate -d -i -s &
-CAFFEINATE_PID=$!
-echo "caffeinate running (PID: $CAFFEINATE_PID)"
-
-# Start ttyd bound to Tailscale IP only
-# Uses tmux-attach.sh wrapper for clean argument handling
 ttyd \
-    --port 7681 \
-    --interface "$TAILSCALE_IP" \
+    --port "$TTYD_PORT" \
+    --interface "$BIND_HOST" \
+    --base-path /terminal \
+    --check-origin \
     --writable \
     -t fontSize=14 \
     -t lineHeight=1.2 \
@@ -38,54 +63,35 @@ ttyd \
     -t cursorStyle=block \
     -t scrollback=10000 \
     -t 'fontFamily="Menlo, Monaco, Consolas, monospace, Apple Color Emoji, Segoe UI Emoji"' \
-    "$SCRIPT_DIR/tmux-attach.sh" \
-    >> "$LOG_DIR/ttyd.log" 2>&1 &
-
+    "$SCRIPT_DIR/tmux-attach.sh" &
 TTYD_PID=$!
-echo "ttyd running (PID: $TTYD_PID) on http://$TAILSCALE_IP:7681"
 
-# Start voice dictation wrapper
-pkill -f "voice-wrapper" 2>/dev/null || true
-python3 "$SCRIPT_DIR/voice-wrapper.py" >> "$LOG_DIR/voice-wrapper.log" 2>&1 &
+BIND_HOST="$BIND_HOST" TTYD_PORT="$TTYD_PORT" WRAPPER_PORT="$WRAPPER_PORT" \
+    "$PYTHON_BIN" "$SCRIPT_DIR/voice-wrapper.py" &
 WRAPPER_PID=$!
-echo "voice wrapper running (PID: $WRAPPER_PID) on http://$TAILSCALE_IP:8080"
 
-echo ""
-echo "=== Remote CLI Ready ==="
-echo "Terminal:  http://$TAILSCALE_IP:7681"
-echo "Voice UI:  http://$TAILSCALE_IP:8080"
-echo ""
-echo "Open the Voice UI URL in Chrome on your iPhone (Tailscale must be active)."
-echo "To stop: $SCRIPT_DIR/stop-remote-cli.sh"
+sleep 1
+if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+    echo "ERROR: ttyd failed to start" >&2
+    exit 1
+fi
+if ! kill -0 "$WRAPPER_PID" 2>/dev/null; then
+    echo "ERROR: voice wrapper failed to start" >&2
+    exit 1
+fi
 
-# Save PIDs for stop script
-echo "$TTYD_PID" > "$LOG_DIR/ttyd.pid"
-echo "$CAFFEINATE_PID" > "$LOG_DIR/caffeinate.pid"
-echo "$WRAPPER_PID" > "$LOG_DIR/voice-wrapper.pid"
-
-# Watchdog: restart ttyd if it crashes, exit cleanly on SIGTERM
-KEEP_RUNNING=true
-trap 'KEEP_RUNNING=false; kill $TTYD_PID 2>/dev/null' TERM INT
-
-while $KEEP_RUNNING; do
-    wait $TTYD_PID 2>/dev/null || true
-    if ! $KEEP_RUNNING; then
-        break
+for port in "$TTYD_PORT" "$WRAPPER_PORT"; do
+    if ! ss -H -ltn "sport = :$port" | grep -Fq "$BIND_HOST:$port"; then
+        echo "ERROR: port $port is not bound to $BIND_HOST" >&2
+        exit 1
     fi
-    echo "[$(date)] ttyd exited, restarting in 5s..." >> "$LOG_DIR/ttyd.log"
-    sleep 5
-    ttyd \
-        --port 7681 \
-        --interface "$TAILSCALE_IP" \
-        --writable \
-        -t fontSize=14 \
-        -t lineHeight=1.2 \
-        -t cursorBlink=true \
-        -t cursorStyle=block \
-        -t scrollback=10000 \
-        "$SCRIPT_DIR/tmux-attach.sh" \
-        >> "$LOG_DIR/ttyd.log" 2>&1 &
-    TTYD_PID=$!
-    echo "$TTYD_PID" > "$LOG_DIR/ttyd.pid"
-    echo "[$(date)] ttyd restarted (PID: $TTYD_PID)" >> "$LOG_DIR/ttyd.log"
 done
+
+echo "=== Remote CLI Ready ==="
+echo "Private URL: $PUBLIC_URL"
+echo "Terminal backend: http://$BIND_HOST:$TTYD_PORT/terminal/"
+echo "Voice backend: http://$BIND_HOST:$WRAPPER_PORT"
+
+wait -n "$TTYD_PID" "$WRAPPER_PID"
+echo "ERROR: remote CLI component exited" >&2
+exit 1
