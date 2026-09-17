@@ -509,7 +509,7 @@ async def index():
 
             // Finger up (dy < 0) → view further down (positive scroll).
             e.preventDefault();
-            scrollTerminalBy(-dy * 1.15);
+            scrollTerminalBy(-dy);
         }}
 
         function onTermTouchEnd(e) {{
