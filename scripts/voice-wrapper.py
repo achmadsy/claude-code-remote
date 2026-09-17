@@ -568,6 +568,30 @@ async def index():
             touchState = null;
         }}
 
+        function gestureStartedOnIframe(e) {{
+            // Reject gestures outside the terminal iframe so quick keys
+            // and the input bar keep normal tap/type behavior.
+            const t = e.touches && e.touches[0];
+            if (!t) return false;
+            const rect = terminal.getBoundingClientRect();
+            return t.clientX >= rect.left && t.clientX <= rect.right &&
+                t.clientY >= rect.top && t.clientY <= rect.bottom;
+        }}
+
+        function onParentTouchStart(e) {{
+            if (e.target === terminal || terminal.contains(e.target)) {{
+                onTermTouchStart(e);
+                return;
+            }}
+            // Chrome often never delivers touches into the iframe doc;
+            // gate by iframe rect when the target is the iframe element.
+            if (gestureStartedOnIframe(e)) {{
+                onTermTouchStart(e);
+            }} else {{
+                touchState = null;
+            }}
+        }}
+
         function attachTerminalTouchScroll() {{
             const doc = terminalDoc();
             if (!doc || !doc.documentElement) return;
@@ -595,8 +619,14 @@ async def index():
         }}
 
         function armTerminalTouchScroll() {{
+            // Parent-document listeners: Chrome iOS does not reliably
+            // deliver touch events that started inside the iframe.
+            document.addEventListener('touchstart', onParentTouchStart, {{ passive: true }});
+            document.addEventListener('touchmove', onTermTouchMove, {{ passive: false }});
+            document.addEventListener('touchend', onTermTouchEnd, {{ passive: true }});
+            document.addEventListener('touchcancel', onTermTouchEnd, {{ passive: true }});
             attachTerminalTouchScroll();
-            // iframe may not be ready on first paint
+            // iframe may not be ready on first paint; retry briefly.
             let tries = 0;
             const timer = setInterval(() => {{
                 attachTerminalTouchScroll();
