@@ -483,6 +483,8 @@ async def index():
                 lastX: e.touches[0].clientX,
                 lastY: e.touches[0].clientY,
                 axis: null,
+                tui: undefined,
+                pending: 0,
             }};
         }}
 
@@ -507,9 +509,39 @@ async def index():
 
             if (touchState.axis !== 'y') return;
 
-            // Finger up (dy < 0) → view further down (positive scroll).
+            // Mode is cached per session on the iframe element: shell vs
+            // TUI decides scroll path. First-ever gesture fetches /mode.
+            if (touchState.tui === undefined) {{
+                touchState.tui = terminal.__paneTui;
+                if (touchState.tui === undefined && !terminal.__modeFetch) {{
+                    terminal.__modeFetch = true;
+                    fetch('/mode').then(r => r.json()).then(d => {{
+                        terminal.__paneTui = !!d.alternate;
+                    }}).catch(() => {{
+                        terminal.__paneTui = false;
+                    }});
+                }}
+            }}
+
+            // Plain shell: scrollTop only — never wheel. Wheel reaches
+            // zsh as arrow sequences and browses input history (the
+            // "scrolling previous input" bug). TUI (alternate screen):
+            // wheel forwarding is what drives scroll in claude/vim.
             e.preventDefault();
-            scrollTerminalBy(-dy);
+            if (touchState.tui === true) {{
+                scrollTerminalBy(-dy);
+            }} else if (touchState.tui === false) {{
+                // Shell: accumulate gesture, drain through scrollTop.
+                touchState.pending += -dy;
+                const step = Math.max(-40, Math.min(40, touchState.pending));
+                if (Math.abs(step) < 10) return;
+                touchState.pending -= step;
+                const targets = scrollTargets();
+                if (targets && targets.viewport) {{
+                    targets.viewport.scrollTop += step;
+                }}
+            }}
+            // tui unknown (fetch in flight): skip this gesture.
         }}
 
         function onTermTouchEnd(e) {{
@@ -605,6 +637,16 @@ async def send_key(payload: KeyInput):
         timeout=5,
     )
     return {"status": "sent"}
+
+
+@app.get("/mode")
+async def term_mode():
+    """Alternate-screen state: TUI (claude/vim) vs plain shell."""
+    result = subprocess.run(
+        [TMUX, "display-message", "-t", TMUX_SESSION, "-p", "#{alternate_on}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return {"alternate": result.stdout.strip() == "1"}
 
 
 @app.get("/copy")
