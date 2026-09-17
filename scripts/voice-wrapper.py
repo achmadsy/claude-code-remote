@@ -446,6 +446,8 @@ async def index():
 
         function scrollTerminalBy(deltaY) {{
             if (!deltaY) return;
+            // Clamp per-event delta: unclamped touch deltas fling too fast.
+            deltaY = Math.max(-40, Math.min(40, deltaY));
             const targets = scrollTargets();
             if (!targets) return;
             const {{ viewport, wheelTarget }} = targets;
