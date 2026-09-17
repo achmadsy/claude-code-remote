@@ -224,8 +224,6 @@ async def index():
             <button onclick="sendKey('C-b')">Ctrl+B</button>
             <button onclick="sendKey('Enter')">Enter</button>
             <button onclick="sendKey('C-l')">Clear</button>
-            <button onclick="scrollPane('up', 5)">&#9650;&#9650;</button>
-            <button onclick="scrollPane('down', 5)">&#9660;&#9660;</button>
             <button onclick="newSession()">New</button>
             <button onclick="resumeSession()">Resume</button>
             <button onclick="copyPane()">Copy</button>
@@ -311,18 +309,6 @@ async def index():
                 }});
             }} catch (err) {{
                 console.error('Key send failed:', err);
-            }}
-        }}
-
-        async function scrollPane(dir, lines) {{
-            try {{
-                await fetch('/scroll', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ dir: dir, lines: lines || 5 }})
-                }});
-            }} catch (err) {{
-                console.error('Scroll failed:', err);
             }}
         }}
 
