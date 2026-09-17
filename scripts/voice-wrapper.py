@@ -58,6 +58,11 @@ class KeyInput(BaseModel):
     key: str
 
 
+class ScrollInput(BaseModel):
+    dir: str  # up | down
+    lines: int = 3
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     ip = get_tailscale_ip()
@@ -219,8 +224,8 @@ async def index():
             <button onclick="sendKey('C-b')">Ctrl+B</button>
             <button onclick="sendKey('Enter')">Enter</button>
             <button onclick="sendKey('C-l')">Clear</button>
-            <button onclick="sendKey('PPage')">PgUp</button>
-            <button onclick="sendKey('NPage')">PgDn</button>
+            <button onclick="scrollPane('up', 5)">&#9650;&#9650;</button>
+            <button onclick="scrollPane('down', 5)">&#9660;&#9660;</button>
             <button onclick="newSession()">New</button>
             <button onclick="resumeSession()">Resume</button>
             <button onclick="copyPane()">Copy</button>
@@ -296,6 +301,18 @@ async def index():
                 }});
             }} catch (err) {{
                 console.error('Key send failed:', err);
+            }}
+        }}
+
+        async function scrollPane(dir, lines) {{
+            try {{
+                await fetch('/scroll', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ dir: dir, lines: lines || 5 }})
+                }});
+            }} catch (err) {{
+                console.error('Scroll failed:', err);
             }}
         }}
 
@@ -523,23 +540,26 @@ async def index():
                 }}
             }}
 
-            // Plain shell: scrollTop only — never wheel. Wheel reaches
-            // zsh as arrow sequences and browses input history (the
-            // "scrolling previous input" bug). TUI (alternate screen):
-            // wheel forwarding is what drives scroll in claude/vim.
+            // Plain shell: drive tmux copy-mode via /scroll so upper
+            // history lines move. Wheel would leak into zsh as arrows
+            // (history browse); xterm scrollTop has no tmux history.
+            // TUI (alternate screen): wheel forwarding drives the app.
             e.preventDefault();
             if (touchState.tui === true) {{
                 scrollTerminalBy(-dy);
             }} else if (touchState.tui === false) {{
-                // Shell: accumulate gesture, drain through scrollTop.
                 touchState.pending += -dy;
                 const step = Math.max(-40, Math.min(40, touchState.pending));
-                if (Math.abs(step) < 10) return;
+                if (Math.abs(step) < 12) return;
                 touchState.pending -= step;
-                const targets = scrollTargets();
-                if (targets && targets.viewport) {{
-                    targets.viewport.scrollTop += step;
-                }}
+                // Finger down (dy>0) → show older lines above → dir=up.
+                const dir = step > 0 ? 'up' : 'down';
+                const lines = Math.max(1, Math.min(8, Math.round(Math.abs(step) / 12)));
+                fetch('/scroll', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{ dir: dir, lines: lines }}),
+                }}).catch(() => {{}});
             }}
             // tui unknown (fetch in flight): skip this gesture.
         }}
@@ -619,6 +639,8 @@ async def index():
 @app.post("/send")
 async def send_text(payload: TextInput):
     """Send literal text to tmux, then press Enter."""
+    # Leave copy-mode first so text hits the prompt, not the selection.
+    subprocess.run([TMUX, "send-keys", "-t", TMUX_SESSION, "Escape"], timeout=3)
     subprocess.run(
         [TMUX, "send-keys", "-t", TMUX_SESSION, "-l", payload.text],
         timeout=5,
@@ -657,6 +679,25 @@ async def term_mode():
         capture_output=True, text=True, timeout=5,
     )
     return {"alternate": result.stdout.strip() == "1"}
+
+
+@app.post("/scroll")
+async def scroll_pane(payload: ScrollInput):
+    """Scroll tmux history via copy-mode (xterm buffer has no upper lines)."""
+    if payload.dir not in ("up", "down"):
+        return {"status": "rejected", "error": "dir must be up or down"}
+    lines = max(1, min(int(payload.lines), 50))
+    try:
+        # Enter copy-mode if not already there (no-op if already in it).
+        subprocess.run([TMUX, "copy-mode", "-t", TMUX_SESSION], timeout=3)
+        if payload.dir == "up":
+            cmd = ["send-keys", "-t", TMUX_SESSION, "-X", f"scroll-up -N {lines}"]
+        else:
+            cmd = ["send-keys", "-t", TMUX_SESSION, "-X", f"scroll-down -N {lines}"]
+        subprocess.run([TMUX] + cmd, timeout=3)
+        return {"status": "scrolled", "dir": payload.dir, "lines": lines}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
 
 
 @app.get("/copy")
