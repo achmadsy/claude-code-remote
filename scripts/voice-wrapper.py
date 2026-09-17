@@ -502,6 +502,7 @@ async def index():
                 axis: null,
                 tui: undefined,
                 pending: 0,
+                scrolledShell: false,
             }};
         }}
 
@@ -544,10 +545,11 @@ async def index():
             // history lines move. Wheel would leak into zsh as arrows
             // (history browse); xterm scrollTop has no tmux history.
             // TUI (alternate screen): wheel forwarding drives the app.
+            // First gesture may not know mode yet — treat unknown as shell.
             e.preventDefault();
             if (touchState.tui === true) {{
                 scrollTerminalBy(-dy);
-            }} else if (touchState.tui === false) {{
+            }} else {{
                 touchState.pending += -dy;
                 const step = Math.max(-40, Math.min(40, touchState.pending));
                 if (Math.abs(step) < 12) return;
@@ -555,17 +557,13 @@ async def index():
                 // Finger down (dy>0) → show older lines above → dir=up.
                 const dir = step > 0 ? 'up' : 'down';
                 const lines = Math.max(1, Math.min(8, Math.round(Math.abs(step) / 12)));
+                touchState.scrolledShell = true;
                 fetch('/scroll', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{ dir: dir, lines: lines }}),
                 }}).catch(() => {{}});
             }}
-            // tui unknown (fetch in flight): skip this gesture.
-        }}
-
-        function onTermTouchEnd(e) {{
-            touchState = null;
         }}
 
         function gestureStartedOnIframe(e) {{
@@ -578,13 +576,21 @@ async def index():
                 t.clientY >= rect.top && t.clientY <= rect.bottom;
         }}
 
-        function onParentTouchStart(e) {{
-            if (e.target === terminal || terminal.contains(e.target)) {{
-                onTermTouchStart(e);
-                return;
+        function onTermTouchEnd(e) {{
+            const wasScrolling = touchState && touchState.scrolledShell;
+            touchState = null;
+            // Leave copy-mode so the next tap types into the prompt,
+            // not a stuck selection. Only if this gesture scrolled.
+            if (wasScrolling) {{
+                fetch('/key', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ key: 'Escape' }})
+                }}).catch(() => {{}});
             }}
-            // Chrome often never delivers touches into the iframe doc;
-            // gate by iframe rect when the target is the iframe element.
+        }}
+
+        function onParentTouchStart(e) {{
             if (gestureStartedOnIframe(e)) {{
                 onTermTouchStart(e);
             }} else {{
@@ -597,13 +603,8 @@ async def index():
             if (!doc || !doc.documentElement) return;
             if (touchHandlersAttached && doc === attachTerminalTouchScroll._doc) return;
 
-            const root = doc.documentElement;
-            root.addEventListener('touchstart', onTermTouchStart, {{ passive: true }});
-            root.addEventListener('touchmove', onTermTouchMove, {{ passive: false }});
-            root.addEventListener('touchend', onTermTouchEnd, {{ passive: true }});
-            root.addEventListener('touchcancel', onTermTouchEnd, {{ passive: true }});
-
-            // Also cover the xterm node if it appears after first paint.
+            // Style only inside the iframe — listeners live on parent
+            // only. Dual parent+iframe listeners double-fired every move.
             const style = doc.createElement('style');
             style.textContent = `
                 html, body, .xterm, .xterm-viewport, .xterm-screen {{
@@ -613,20 +614,18 @@ async def index():
                 }}
             `;
             doc.documentElement.appendChild(style);
-
             touchHandlersAttached = true;
             attachTerminalTouchScroll._doc = doc;
         }}
 
         function armTerminalTouchScroll() {{
-            // Parent-document listeners: Chrome iOS does not reliably
-            // deliver touch events that started inside the iframe.
+            // Parent-document only: Chrome iOS does not reliably deliver
+            // touches into the iframe; dual listeners double-scrolled.
             document.addEventListener('touchstart', onParentTouchStart, {{ passive: true }});
             document.addEventListener('touchmove', onTermTouchMove, {{ passive: false }});
             document.addEventListener('touchend', onTermTouchEnd, {{ passive: true }});
             document.addEventListener('touchcancel', onTermTouchEnd, {{ passive: true }});
             attachTerminalTouchScroll();
-            // iframe may not be ready on first paint; retry briefly.
             let tries = 0;
             const timer = setInterval(() => {{
                 attachTerminalTouchScroll();
