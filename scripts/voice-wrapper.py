@@ -265,6 +265,16 @@ async def index():
             }}
         }});
 
+        // Focusing the input bar must leave tmux copy-mode (history view)
+        // or keys never reach the prompt. Same reason Ctrl+C "fixed" it.
+        input.addEventListener('focus', () => {{
+            fetch('/key', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ key: 'Escape' }})
+            }}).catch(() => {{}});
+        }});
+
         async function sendText(override) {{
             let text = override || input.value.trim();
             if (!text) return;
@@ -461,49 +471,78 @@ async def index():
             return {{ viewport, wheelTarget }};
         }}
 
-        function scrollTerminalBy(deltaY) {{
+        function scrollTerminalBy(deltaY, clientX, clientY, via) {{
             if (!deltaY) return;
-            // Clamp per-event delta: unclamped touch deltas fling too fast.
             deltaY = Math.max(-40, Math.min(40, deltaY));
             const targets = scrollTargets();
             if (!targets) return;
-            const {{ viewport, wheelTarget }} = targets;
+            const {{ wheelTarget }} = targets;
 
-            // Real scrollable viewport: adjust scrollTop directly (no wheel, avoids 2x).
-            if (typeof viewport.scrollTop === 'number') {{
-                const before = viewport.scrollTop;
-                viewport.scrollTop = before + deltaY;
-                if (viewport.scrollTop !== before) return;
+            // Desktop mouse path ONLY. Never scrollTop (xterm buffer is
+            // just the visible pane — no tmux history). Coordinate wheel
+            // → SGR mouse → tmux `mouse on` scrolls terminal history.
+            // Without mouse, xterm turns wheel into Up/Down keys and zsh
+            // browses INPUT history instead.
+            let x = 0;
+            let y = 0;
+            if (via === 'iframe') {{
+                x = Number.isFinite(clientX) ? clientX : 0;
+                y = Number.isFinite(clientY) ? clientY : 0;
+            }} else {{
+                const frame = terminal.getBoundingClientRect();
+                x = Number.isFinite(clientX) ? clientX - frame.left : 0;
+                y = Number.isFinite(clientY) ? clientY - frame.top : 0;
             }}
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
 
-            // Virtual/transformed viewport: ask xterm via wheel.
             try {{
-                wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
+                const win = terminal.contentWindow;
+                const Ctor = (win && win.WheelEvent) || WheelEvent;
+                wheelTarget.dispatchEvent(new Ctor('wheel', {{
                     deltaX: 0,
                     deltaY: deltaY,
                     deltaMode: 0,
                     bubbles: true,
                     cancelable: true,
-                    view: terminal.contentWindow,
+                    view: win || window,
+                    clientX: x,
+                    clientY: y,
+                    screenX: x,
+                    screenY: y,
                 }}));
             }} catch (err) {{
                 // ignore
             }}
         }}
 
-        function onTermTouchStart(e) {{
+        function leaveCopyMode() {{
+            fetch('/key', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ key: 'Escape' }})
+            }}).catch(() => {{}});
+        }}
+
+        function onTermTouchStart(e, via) {{
             if (e.touches.length !== 1) {{
                 touchState = null;
                 return;
             }}
+            // First start claims the gesture (parent+iframe may both fire).
+            if (touchState && touchState.fresh) return;
             touchState = {{
+                via: via || 'parent',
+                fresh: true,
                 lastX: e.touches[0].clientX,
                 lastY: e.touches[0].clientY,
                 axis: null,
                 tui: undefined,
                 pending: 0,
-                scrolledShell: false,
+                lastWheelAt: 0,
+                scrolled: false,
             }};
+            setTimeout(() => {{ if (touchState) touchState.fresh = false; }}, 0);
         }}
 
         function onTermTouchMove(e) {{
@@ -527,8 +566,8 @@ async def index():
 
             if (touchState.axis !== 'y') return;
 
-            // Mode is cached per session on the iframe element: shell vs
-            // TUI decides scroll path. First-ever gesture fetches /mode.
+            // Always desktop mouse wheel (shell + TUI). Mode only matters
+            // for tap-to-type Escape (don't punch Escape into a TUI).
             if (touchState.tui === undefined) {{
                 touchState.tui = terminal.__paneTui;
                 if (touchState.tui === undefined && !terminal.__modeFetch) {{
@@ -541,34 +580,19 @@ async def index():
                 }}
             }}
 
-            // Plain shell: drive tmux copy-mode via /scroll so upper
-            // history lines move. Wheel would leak into zsh as arrows
-            // (history browse); xterm scrollTop has no tmux history.
-            // TUI (alternate screen): wheel forwarding drives the app.
-            // First gesture may not know mode yet — treat unknown as shell.
             e.preventDefault();
-            if (touchState.tui === true) {{
-                scrollTerminalBy(-dy);
-            }} else {{
-                touchState.pending += -dy;
-                const step = Math.max(-40, Math.min(40, touchState.pending));
-                if (Math.abs(step) < 12) return;
-                touchState.pending -= step;
-                // Finger down (dy>0) → show older lines above → dir=up.
-                const dir = step > 0 ? 'up' : 'down';
-                const lines = Math.max(1, Math.min(8, Math.round(Math.abs(step) / 12)));
-                touchState.scrolledShell = true;
-                fetch('/scroll', {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{ dir: dir, lines: lines }}),
-                }}).catch(() => {{}});
-            }}
+            touchState.pending += -dy;
+            if (Math.abs(touchState.pending) < 10) return;
+            const now = Date.now();
+            if (now - touchState.lastWheelAt < 35) return;
+            const step = Math.max(-40, Math.min(40, touchState.pending));
+            touchState.pending -= step;
+            touchState.lastWheelAt = now;
+            scrollTerminalBy(step, x, y, touchState.via);
+            touchState.scrolled = true;
         }}
 
         function gestureStartedOnIframe(e) {{
-            // Reject gestures outside the terminal iframe so quick keys
-            // and the input bar keep normal tap/type behavior.
             const t = e.touches && e.touches[0];
             if (!t) return false;
             const rect = terminal.getBoundingClientRect();
@@ -577,24 +601,19 @@ async def index():
         }}
 
         function onTermTouchEnd(e) {{
-            const wasScrolling = touchState && touchState.scrolledShell;
+            const didScroll = !!(touchState && touchState.scrolled);
+            const isTui = !!(touchState && touchState.tui === true);
             touchState = null;
-            // Leave copy-mode so the next tap types into the prompt,
-            // not a stuck selection. Only if this gesture scrolled.
-            if (wasScrolling) {{
-                fetch('/key', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ key: 'Escape' }})
-                }}).catch(() => {{}});
+            // Swipe: keep history view (don't snap to bottom).
+            // Tap on shell: leave copy-mode so the next key types.
+            if (!didScroll && !isTui) {{
+                leaveCopyMode();
             }}
         }}
 
         function onParentTouchStart(e) {{
             if (gestureStartedOnIframe(e)) {{
-                onTermTouchStart(e);
-            }} else {{
-                touchState = null;
+                onTermTouchStart(e, 'parent');
             }}
         }}
 
@@ -603,8 +622,6 @@ async def index():
             if (!doc || !doc.documentElement) return;
             if (touchHandlersAttached && doc === attachTerminalTouchScroll._doc) return;
 
-            // Style only inside the iframe — listeners live on parent
-            // only. Dual parent+iframe listeners double-fired every move.
             const style = doc.createElement('style');
             style.textContent = `
                 html, body, .xterm, .xterm-viewport, .xterm-screen {{
@@ -614,17 +631,35 @@ async def index():
                 }}
             `;
             doc.documentElement.appendChild(style);
+
+            // Conversation text lives in the iframe — must listen there.
+            // Parent path kept for touches that start outside then drift in.
+            doc.addEventListener('touchstart', (e) => {{
+                onTermTouchStart(e, 'iframe');
+            }}, {{ passive: true }});
+            doc.addEventListener('touchmove', (e) => {{
+                if (touchState && touchState.via === 'iframe') onTermTouchMove(e);
+            }}, {{ passive: false }});
+            const endIframe = (e) => {{
+                if (touchState && touchState.via === 'iframe') onTermTouchEnd(e);
+            }};
+            doc.addEventListener('touchend', endIframe, {{ passive: true }});
+            doc.addEventListener('touchcancel', endIframe, {{ passive: true }});
+
             touchHandlersAttached = true;
             attachTerminalTouchScroll._doc = doc;
         }}
 
         function armTerminalTouchScroll() {{
-            // Parent-document only: Chrome iOS does not reliably deliver
-            // touches into the iframe; dual listeners double-scrolled.
             document.addEventListener('touchstart', onParentTouchStart, {{ passive: true }});
-            document.addEventListener('touchmove', onTermTouchMove, {{ passive: false }});
-            document.addEventListener('touchend', onTermTouchEnd, {{ passive: true }});
-            document.addEventListener('touchcancel', onTermTouchEnd, {{ passive: true }});
+            document.addEventListener('touchmove', (e) => {{
+                if (touchState && touchState.via === 'parent') onTermTouchMove(e);
+            }}, {{ passive: false }});
+            const endParent = (e) => {{
+                if (touchState && touchState.via === 'parent') onTermTouchEnd(e);
+            }};
+            document.addEventListener('touchend', endParent, {{ passive: true }});
+            document.addEventListener('touchcancel', endParent, {{ passive: true }});
             attachTerminalTouchScroll();
             let tries = 0;
             const timer = setInterval(() => {{
@@ -644,7 +679,8 @@ async def index():
         document.addEventListener('visibilitychange', () => {{
             if (document.visibilityState === 'visible') {{
                 terminal.src = terminal.src;
-                armTerminalTouchScroll();
+                touchHandlersAttached = false;
+                setTimeout(() => attachTerminalTouchScroll(), 400);
             }}
         }});
 
