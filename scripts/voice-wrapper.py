@@ -599,6 +599,16 @@ async def index():
             }}
         }});
 
+        function pollPaneMode() {{
+            // Keep shell/TUI state fresh: alternate_on flips when claude
+            // or vim starts/stops inside the pane.
+            fetch('/mode').then(r => r.json()).then(d => {{
+                terminal.__paneTui = !!d.alternate;
+            }}).catch(() => {{}});
+        }}
+        setInterval(pollPaneMode, 3000);
+        pollPaneMode();
+
         armTerminalTouchScroll();
         input.focus();
     </script>
