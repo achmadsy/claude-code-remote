@@ -461,24 +461,22 @@ async def index():
             return {{ viewport, wheelTarget }};
         }}
 
-        function scrollTerminalBy(deltaY, clientX, clientY) {{
+        function scrollTerminalBy(deltaY) {{
             if (!deltaY) return;
             // Clamp per-event delta: unclamped touch deltas fling too fast.
             deltaY = Math.max(-40, Math.min(40, deltaY));
             const targets = scrollTargets();
             if (!targets) return;
-            const {{ wheelTarget }} = targets;
+            const {{ viewport, wheelTarget }} = targets;
 
-            // Same path as a desktop mouse wheel: coordinate-bearing
-            // WheelEvent on xterm → SGR mouse report → tmux (mouse on)
-            // enters copy-mode / drives the TUI. No scrollTop shortcut —
-            // that skipped mouse reporting and flung the buffer.
-            const frame = terminal.getBoundingClientRect();
-            let x = Number.isFinite(clientX) ? clientX - frame.left : 0;
-            let y = Number.isFinite(clientY) ? clientY - frame.top : 0;
-            if (!Number.isFinite(x) || x < 0) x = 0;
-            if (!Number.isFinite(y) || y < 0) y = 0;
+            // Real scrollable viewport: adjust scrollTop directly (no wheel, avoids 2x).
+            if (typeof viewport.scrollTop === 'number') {{
+                const before = viewport.scrollTop;
+                viewport.scrollTop = before + deltaY;
+                if (viewport.scrollTop !== before) return;
+            }}
 
+            // Virtual/transformed viewport: ask xterm via wheel.
             try {{
                 wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
                     deltaX: 0,
@@ -487,10 +485,6 @@ async def index():
                     bubbles: true,
                     cancelable: true,
                     view: terminal.contentWindow,
-                    clientX: x,
-                    clientY: y,
-                    screenX: x,
-                    screenY: y,
                 }}));
             }} catch (err) {{
                 // ignore
@@ -508,7 +502,6 @@ async def index():
                 axis: null,
                 tui: undefined,
                 pending: 0,
-                lastWheelAt: 0,
                 scrolledShell: false,
             }};
         }}
@@ -534,8 +527,8 @@ async def index():
 
             if (touchState.axis !== 'y') return;
 
-            // Mode is only needed so touchend can leave tmux copy-mode
-            // after a shell scroll without punching Escape into a TUI.
+            // Mode is cached per session on the iframe element: shell vs
+            // TUI decides scroll path. First-ever gesture fetches /mode.
             if (touchState.tui === undefined) {{
                 touchState.tui = terminal.__paneTui;
                 if (touchState.tui === undefined && !terminal.__modeFetch) {{
@@ -548,20 +541,29 @@ async def index():
                 }}
             }}
 
-            // Unified mouse path (shell + TUI): accumulate swipe, throttle,
-            // dispatch coordinate WheelEvent — identical to desktop wheel.
-            // tmux `mouse on` turns that into copy-mode / app scroll; no
-            // /scroll POST, no zsh history pollution from bare arrows.
+            // Plain shell: drive tmux copy-mode via /scroll so upper
+            // history lines move. Wheel would leak into zsh as arrows
+            // (history browse); xterm scrollTop has no tmux history.
+            // TUI (alternate screen): wheel forwarding drives the app.
+            // First gesture may not know mode yet — treat unknown as shell.
             e.preventDefault();
-            touchState.pending += -dy;
-            if (Math.abs(touchState.pending) < 10) return;
-            const now = Date.now();
-            if (now - touchState.lastWheelAt < 35) return;
-            const step = Math.max(-40, Math.min(40, touchState.pending));
-            touchState.pending -= step;
-            touchState.lastWheelAt = now;
-            scrollTerminalBy(step, x, y);
-            touchState.scrolledShell = touchState.tui !== true;
+            if (touchState.tui === true) {{
+                scrollTerminalBy(-dy);
+            }} else {{
+                touchState.pending += -dy;
+                const step = Math.max(-40, Math.min(40, touchState.pending));
+                if (Math.abs(step) < 12) return;
+                touchState.pending -= step;
+                // Finger down (dy>0) → show older lines above → dir=up.
+                const dir = step > 0 ? 'up' : 'down';
+                const lines = Math.max(1, Math.min(8, Math.round(Math.abs(step) / 12)));
+                touchState.scrolledShell = true;
+                fetch('/scroll', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{ dir: dir, lines: lines }}),
+                }}).catch(() => {{}});
+            }}
         }}
 
         function gestureStartedOnIframe(e) {{
